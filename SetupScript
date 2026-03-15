@@ -1,4 +1,4 @@
-✅ Copy/paste code (single cell)
+
 # Databricks notebook: Starter dataset generator
 # Creates: raw_customers, raw_orders, raw_payments, raw_orders_new_batch
 # Includes: duplicates + late arrivals + updates
