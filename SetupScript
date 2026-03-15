@@ -1,0 +1,244 @@
+✅ Copy/paste code (single cell)
+# Databricks notebook: Starter dataset generator
+# Creates: raw_customers, raw_orders, raw_payments, raw_orders_new_batch
+# Includes: duplicates + late arrivals + updates
+
+from pyspark.sql import functions as F
+from pyspark.sql import types as T
+import random
+from datetime import datetime, timedelta
+
+# ----------------------------
+# CONFIG
+# ----------------------------
+SEED = 42
+random.seed(SEED)
+
+# Choose your schema/database (Unity Catalog or Hive metastore)
+# Examples:
+#   catalog.schema   (Unity Catalog)
+#   schema           (Hive metastore)
+TARGET_SCHEMA = "default"   # <-- change if needed
+
+# Table names
+T_CUSTOMERS = f"{TARGET_SCHEMA}.raw_customers"
+T_ORDERS = f"{TARGET_SCHEMA}.raw_orders"
+T_PAYMENTS = f"{TARGET_SCHEMA}.raw_payments"
+T_NEWBATCH = f"{TARGET_SCHEMA}.raw_orders_new_batch"
+
+# Size
+N_CUSTOMERS = 200
+N_ORDERS_BASE = 1200
+DUPLICATE_RATE = 0.08        # percent of orders duplicated in raw_orders
+PAYMENT_SUCCESS_RATE = 0.75  # percent of orders that have successful payments
+
+START_DATE = datetime(2025, 12, 1)
+DAYS = 30
+
+# ----------------------------
+# HELPERS
+# ----------------------------
+def rand_date(start: datetime, days: int):
+    d = start + timedelta(days=random.randint(0, days-1))
+    # random time in day
+    return d + timedelta(hours=random.randint(0,23), minutes=random.randint(0,59), seconds=random.randint(0,59))
+
+def gen_customers(n):
+    rows = []
+    for i in range(1, n+1):
+        signup = rand_date(START_DATE - timedelta(days=60), 60)
+        rows.append((
+            f"C{i:05d}",
+            signup,
+            random.choice(["US","CA","UK","NG"]),
+            random.choice(["Free","Pro","Enterprise"])
+        ))
+    return rows
+
+def gen_orders(n_orders, customers):
+    rows = []
+    for i in range(1, n_orders+1):
+        order_id = f"O{i:07d}"
+        cust = random.choice(customers)
+        order_ts = rand_date(START_DATE, DAYS)
+        amount = round(random.uniform(10, 500), 2)
+        status = random.choice(["CREATED","CREATED","CREATED","CANCELLED"])  # mostly created
+        ingest_time = order_ts + timedelta(minutes=random.randint(1, 180))   # ingest after event
+        rows.append((order_id, cust, order_ts, amount, status, ingest_time))
+    return rows
+
+def add_duplicates(order_rows, dup_rate):
+    """Create duplicates of some orders with same order_id but slightly different ingest_time and maybe updated fields."""
+    rows = list(order_rows)
+    n_dups = int(len(order_rows) * dup_rate)
+    dup_indices = random.sample(range(len(order_rows)), n_dups)
+    for idx in dup_indices:
+        (order_id, cust, order_ts, amount, status, ingest_time) = order_rows[idx]
+        # create a later duplicate (could represent replay or corrected record)
+        new_ingest = ingest_time + timedelta(minutes=random.randint(5, 240))
+        # small chance amount changes (simulate correction)
+        if random.random() < 0.35:
+            amount = round(amount + random.uniform(-5, 20), 2)
+            amount = max(amount, 1.0)
+        # small chance status changes (simulate cancellation update)
+        if random.random() < 0.10:
+            status = "CANCELLED"
+        rows.append((order_id, cust, order_ts, amount, status, new_ingest))
+    return rows
+
+def gen_payments(order_rows, success_rate):
+    rows = []
+    pay_id = 1
+    for (order_id, cust, order_ts, amount, status, ingest_time) in order_rows:
+        # Skip cancelled orders often
+        if status == "CANCELLED" and random.random() < 0.85:
+            continue
+        # Some orders won't have payments
+        if random.random() > success_rate:
+            # create a failed or pending payment sometimes
+            if random.random() < 0.35:
+                payment_ts = order_ts + timedelta(minutes=random.randint(10, 1440))
+                p_status = random.choice(["FAILED","PENDING"])
+                rows.append((f"P{pay_id:08d}", order_id, payment_ts, round(amount,2), p_status, payment_ts + timedelta(minutes=5)))
+                pay_id += 1
+            continue
+
+        # Successful payment
+        payment_ts = order_ts + timedelta(minutes=random.randint(10, 1440))
+        rows.append((f"P{pay_id:08d}", order_id, payment_ts, round(amount,2), "SUCCESS", payment_ts + timedelta(minutes=5)))
+        pay_id += 1
+    return rows
+
+# ----------------------------
+# GENERATE DATA
+# ----------------------------
+customers = gen_customers(N_CUSTOMERS)
+customer_ids = [r[0] for r in customers]
+
+orders_base = gen_orders(N_ORDERS_BASE, customer_ids)
+orders_with_dups = add_duplicates(orders_base, DUPLICATE_RATE)
+
+payments = gen_payments(orders_base, PAYMENT_SUCCESS_RATE)  # payments generated off base (not duplicates)
+
+# New batch:
+# - some brand new orders
+# - some duplicate replays
+# - some late-arriving updates for existing order_ids (higher ingest_time)
+N_NEW = 140
+new_orders = gen_orders(N_NEW, customer_ids)
+
+# Late-arriving updates: pick some existing order_ids and "update" them with later ingest_time
+late_updates = []
+late_pick = random.sample(orders_base, 60)
+for (order_id, cust, order_ts, amount, status, ingest_time) in late_pick:
+    updated_ingest = ingest_time + timedelta(days=random.randint(2, 10), minutes=random.randint(30, 240))
+    # simulate corrections
+    amount2 = round(amount + random.uniform(-10, 30), 2)
+    amount2 = max(amount2, 1.0)
+    status2 = status
+    if random.random() < 0.15:
+        status2 = "CANCELLED"
+    late_updates.append((order_id, cust, order_ts, amount2, status2, updated_ingest))
+
+# Replays/duplicates in new batch
+replays = []
+replay_pick = random.sample(orders_base, 40)
+for (order_id, cust, order_ts, amount, status, ingest_time) in replay_pick:
+    replay_ingest = ingest_time + timedelta(days=random.randint(1, 6), minutes=random.randint(1, 120))
+    replays.append((order_id, cust, order_ts, amount, status, replay_ingest))
+
+new_batch_rows = new_orders + late_updates + replays
+
+# ----------------------------
+# CREATE DATAFRAMES
+# ----------------------------
+cust_schema = T.StructType([
+    T.StructField("customer_id", T.StringType(), False),
+    T.StructField("signup_timestamp", T.TimestampType(), True),
+    T.StructField("country", T.StringType(), True),
+    T.StructField("plan", T.StringType(), True)
+])
+
+order_schema = T.StructType([
+    T.StructField("order_id", T.StringType(), False),
+    T.StructField("customer_id", T.StringType(), False),
+    T.StructField("order_timestamp", T.TimestampType(), True),
+    T.StructField("order_amount", T.DoubleType(), True),
+    T.StructField("status", T.StringType(), True),
+    T.StructField("ingest_time", T.TimestampType(), True)
+])
+
+pay_schema = T.StructType([
+    T.StructField("payment_id", T.StringType(), False),
+    T.StructField("order_id", T.StringType(), False),
+    T.StructField("payment_timestamp", T.TimestampType(), True),
+    T.StructField("amount", T.DoubleType(), True),
+    T.StructField("payment_status", T.StringType(), True),
+    T.StructField("ingest_time", T.TimestampType(), True)
+])
+
+df_customers = spark.createDataFrame(customers, cust_schema)
+df_orders = spark.createDataFrame(orders_with_dups, order_schema)
+df_payments = spark.createDataFrame(payments, pay_schema)
+df_newbatch = spark.createDataFrame(new_batch_rows, order_schema)
+
+# ----------------------------
+# WRITE TABLES (Delta)
+# ----------------------------
+spark.sql(f"CREATE SCHEMA IF NOT EXISTS {TARGET_SCHEMA}")
+
+(df_customers
+ .write.format("delta")
+ .mode("overwrite")
+ .saveAsTable(T_CUSTOMERS))
+
+(df_orders
+ .write.format("delta")
+ .mode("overwrite")
+ .saveAsTable(T_ORDERS))
+
+(df_payments
+ .write.format("delta")
+ .mode("overwrite")
+ .saveAsTable(T_PAYMENTS))
+
+(df_newbatch
+ .write.format("delta")
+ .mode("overwrite")
+ .saveAsTable(T_NEWBATCH))
+
+# ----------------------------
+# SANITY CHECKS
+# ----------------------------
+print("Created tables:")
+print(" -", T_CUSTOMERS)
+print(" -", T_ORDERS)
+print(" -", T_PAYMENTS)
+print(" -", T_NEWBATCH)
+
+dup_check = spark.sql(f"""
+SELECT
+  count(*) AS total_rows,
+  count(DISTINCT order_id) AS distinct_orders,
+  (count(*) - count(DISTINCT order_id)) AS duplicate_rows
+FROM {T_ORDERS}
+""")
+dup_check.show(truncate=False)
+
+late_check = spark.sql(f"""
+SELECT
+  count(*) AS new_batch_rows,
+  count(DISTINCT order_id) AS new_batch_distinct_order_ids
+FROM {T_NEWBATCH}
+""")
+late_check.show(truncate=False)
+
+How to use this generator in your course
+
+Run the generator cell once.
+
+In Databricks SQL, run:
+
+SELECT count(*), count(distinct order_id) FROM default.raw_orders;
+
+
